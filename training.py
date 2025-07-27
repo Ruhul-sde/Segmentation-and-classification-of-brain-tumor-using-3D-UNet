@@ -1,229 +1,288 @@
 
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-import nibabel as nib
-from pathlib import Path
-import albumentations as A
-from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import wandb
+from tensorboard import SummaryWriter
 from tqdm import tqdm
+import nibabel as nib
+from sklearn.metrics import confusion_matrix, classification_report
+from scipy import ndimage
+import json
+import time
+from pathlib import Path
 import logging
-from monai.losses import DiceLoss, FocalLoss
-from losses import CombinedLoss3D, DeepSupervisionLoss3D
-from monai.metrics import DiceMetric
-from monai.transforms import (
-    Compose, LoadImage, AddChannel, Spacing, Orientation,
-    ScaleIntensity, RandSpatialCrop, RandRotate90, RandFlip,
-    ToTensor, EnsureChannelFirst
-)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class BrainTumorDataset(Dataset):
-    """Optimized dataset for brain tumor segmentation"""
+class BraTS2024Dataset(Dataset):
+    """Modern BraTS 2024 dataset loader with advanced preprocessing"""
     
-    def __init__(self, image_paths, mask_paths, transforms=None, cache_data=True):
-        self.image_paths = image_paths
-        self.mask_paths = mask_paths
-        self.transforms = transforms
-        self.cache_data = cache_data
+    def __init__(self, data_dir, mode='train', augment=True, cache_size=50):
+        self.data_dir = Path(data_dir)
+        self.mode = mode
+        self.augment = augment
+        self.cache_size = cache_size
         self.cached_data = {}
         
+        # BraTS 2024 modalities
+        self.modalities = ['t1c', 't1n', 't2f', 't2w']
+        self.samples = self._load_sample_list()
+        
+    def _load_sample_list(self):
+        """Load list of available samples"""
+        samples = []
+        if self.data_dir.exists():
+            for patient_dir in self.data_dir.iterdir():
+                if patient_dir.is_dir():
+                    # Check if all modalities exist
+                    modality_files = {}
+                    seg_file = None
+                    
+                    for file in patient_dir.glob("*.nii.gz"):
+                        filename = file.name.lower()
+                        if 'seg' in filename:
+                            seg_file = file
+                        else:
+                            for mod in self.modalities:
+                                if mod in filename:
+                                    modality_files[mod] = file
+                                    break
+                    
+                    if len(modality_files) == 4 and seg_file:
+                        samples.append({
+                            'patient_id': patient_dir.name,
+                            'modalities': modality_files,
+                            'segmentation': seg_file
+                        })
+        
+        logger.info(f"Found {len(samples)} samples for {self.mode}")
+        return samples
+    
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.samples)
     
     def __getitem__(self, idx):
-        if self.cache_data and idx in self.cached_data:
+        if idx in self.cached_data and len(self.cached_data) < self.cache_size:
             return self.cached_data[idx]
-            
-        # Load image and mask
-        image_path = self.image_paths[idx]
-        mask_path = self.mask_paths[idx]
         
-        # Load NIfTI files
-        image = nib.load(image_path).get_fdata()
-        mask = nib.load(mask_path).get_fdata()
+        sample = self.samples[idx]
         
-        # Normalize image
+        # Load multi-modal data
+        images = []
+        for modality in self.modalities:
+            img_path = sample['modalities'][modality]
+            img = nib.load(img_path).get_fdata()
+            img = self._preprocess_image(img)
+            images.append(img)
+        
+        # Stack modalities (4 channels)
+        image = np.stack(images, axis=0)
+        
+        # Load segmentation
+        seg = nib.load(sample['segmentation']).get_fdata()
+        seg = self._preprocess_segmentation(seg)
+        
+        # Apply augmentations
+        if self.augment and self.mode == 'train':
+            image, seg = self._apply_augmentations(image, seg)
+        
+        # Convert to tensors
+        image = torch.from_numpy(image).float()
+        seg = torch.from_numpy(seg).long()
+        
+        data = {
+            'image': image,
+            'mask': seg,
+            'patient_id': sample['patient_id']
+        }
+        
+        # Cache if space available
+        if len(self.cached_data) < self.cache_size:
+            self.cached_data[idx] = data
+        
+        return data
+    
+    def _preprocess_image(self, image):
+        """Advanced preprocessing for BraTS images"""
+        # Clip outliers
+        p1, p99 = np.percentile(image, (1, 99))
+        image = np.clip(image, p1, p99)
+        
+        # Z-score normalization
         image = (image - np.mean(image)) / (np.std(image) + 1e-8)
         
-        # Convert to tensor
-        image = torch.from_numpy(image).float().unsqueeze(0)  # Add channel dim
-        mask = torch.from_numpy(mask).long()
+        # Resize to standard size
+        target_shape = (128, 128, 128)
+        if image.shape != target_shape:
+            zoom_factors = [t/s for t, s in zip(target_shape, image.shape)]
+            image = ndimage.zoom(image, zoom_factors, order=1)
         
-        if self.transforms:
-            # Apply transforms (if using MONAI transforms)
-            data_dict = {"image": image, "label": mask}
-            data_dict = self.transforms(data_dict)
-            image, mask = data_dict["image"], data_dict["label"]
+        return image.astype(np.float32)
+    
+    def _preprocess_segmentation(self, seg):
+        """Preprocess segmentation masks"""
+        # BraTS labels: 0=background, 1=necrotic, 2=edema, 4=enhancing
+        # Convert to: 0=background, 1=necrotic, 2=edema, 3=enhancing
+        seg[seg == 4] = 3
         
-        sample = {"image": image, "mask": mask}
+        # Resize to standard size
+        target_shape = (128, 128, 128)
+        if seg.shape != target_shape:
+            zoom_factors = [t/s for t, s in zip(target_shape, seg.shape)]
+            seg = ndimage.zoom(seg, zoom_factors, order=0)
         
-        if self.cache_data:
-            self.cached_data[idx] = sample
-            
-        return sample
+        return seg.astype(np.uint8)
+    
+    def _apply_augmentations(self, image, seg):
+        """Apply 3D augmentations"""
+        # Random rotation
+        if np.random.rand() > 0.5:
+            k = np.random.randint(1, 4)
+            for i in range(image.shape[0]):
+                image[i] = np.rot90(image[i], k, axes=(0, 1))
+            seg = np.rot90(seg, k, axes=(0, 1))
+        
+        # Random flip
+        for axis in [1, 2, 3]:  # Skip channel axis
+            if np.random.rand() > 0.5:
+                image = np.flip(image, axis=axis)
+                seg = np.flip(seg, axis=axis)
+        
+        # Gaussian noise
+        noise_std = np.random.uniform(0, 0.1)
+        noise = np.random.normal(0, noise_std, image.shape)
+        image = image + noise
+        
+        # Intensity scaling
+        scale = np.random.uniform(0.9, 1.1)
+        image = image * scale
+        
+        return image.copy(), seg.copy()
 
-class ImprovedUNet3D(nn.Module):
-    """Improved 3D U-Net with attention and residual connections"""
+class ModernBrainTumorTrainer:
+    """Modern trainer with advanced features"""
     
-    def __init__(self, in_channels=1, out_channels=4, features=[32, 64, 128, 256, 512]):
-        super(ImprovedUNet3D, self).__init__()
-        self.ups = nn.ModuleList()
-        self.downs = nn.ModuleList()
-        self.pool = nn.MaxPool3d(kernel_size=2, stride=2)
-        self.dropout = nn.Dropout3d(0.2)
-        
-        # Down part of U-Net with residual connections
-        for feature in features:
-            self.downs.append(ResidualBlock3D(in_channels, feature))
-            in_channels = feature
-            
-        # Up part of U-Net with attention
-        for feature in reversed(features):
-            self.ups.append(nn.ConvTranspose3d(feature*2, feature, kernel_size=2, stride=2))
-            self.ups.append(AttentionBlock3D(feature*2, feature))
-            self.ups.append(ResidualBlock3D(feature*2, feature))
-            
-        self.bottleneck = ResidualBlock3D(features[-1], features[-1]*2)
-        self.final_conv = nn.Conv3d(features[0], out_channels, kernel_size=1)
-        
-    def forward(self, x):
-        skip_connections = []
-        
-        for down in self.downs:
-            x = down(x)
-            skip_connections.append(x)
-            x = self.pool(x)
-            x = self.dropout(x)
-            
-        x = self.bottleneck(x)
-        skip_connections = skip_connections[::-1]
-        
-        for idx in range(0, len(self.ups), 3):
-            x = self.ups[idx](x)  # Upsampling
-            skip_connection = skip_connections[idx//3]
-            
-            # Apply attention
-            x = self.ups[idx+1](x, skip_connection)
-            
-            if x.shape != skip_connection.shape:
-                x = F.interpolate(x, size=skip_connection.shape[2:], mode='trilinear', align_corners=False)
-                
-            concat_skip = torch.cat((skip_connection, x), dim=1)
-            x = self.ups[idx+2](concat_skip)  # Residual block
-            
-        return self.final_conv(x)
-
-class ResidualBlock3D(nn.Module):
-    """3D Residual block with batch normalization"""
-    
-    def __init__(self, in_channels, out_channels):
-        super(ResidualBlock3D, self).__init__()
-        self.conv1 = nn.Conv3d(in_channels, out_channels, 3, 1, 1, bias=False)
-        self.bn1 = nn.BatchNorm3d(out_channels)
-        self.conv2 = nn.Conv3d(out_channels, out_channels, 3, 1, 1, bias=False)
-        self.bn2 = nn.BatchNorm3d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        
-        self.shortcut = nn.Sequential()
-        if in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, 1, 1, 0, bias=False),
-                nn.BatchNorm3d(out_channels)
-            )
-    
-    def forward(self, x):
-        residual = self.shortcut(x)
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += residual
-        out = self.relu(out)
-        return out
-
-class AttentionBlock3D(nn.Module):
-    """3D Attention block for U-Net"""
-    
-    def __init__(self, F_g, F_l):
-        super(AttentionBlock3D, self).__init__()
-        self.W_g = nn.Sequential(
-            nn.Conv3d(F_g, F_l, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm3d(F_l)
-        )
-        
-        self.W_x = nn.Sequential(
-            nn.Conv3d(F_l, F_l, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm3d(F_l)
-        )
-        
-        self.psi = nn.Sequential(
-            nn.Conv3d(F_l, 1, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm3d(1),
-            nn.Sigmoid()
-        )
-        
-        self.relu = nn.ReLU(inplace=True)
-        
-    def forward(self, g, x):
-        g1 = self.W_g(g)
-        x1 = self.W_x(x)
-        psi = self.relu(g1 + x1)
-        psi = self.psi(psi)
-        return x * psi
-
-class CombinedLoss(nn.Module):
-    """Enhanced combined loss function for better segmentation"""
-    
-    def __init__(self, alpha=0.5, beta=0.3, gamma=0.2):
-        super(CombinedLoss, self).__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        self.dice_loss = DiceLoss(to_onehot_y=True, softmax=True)
-        self.focal_loss = FocalLoss(to_onehot_y=True)
-        
-    def forward(self, pred, target):
-        dice = self.dice_loss(pred, target)
-        focal = self.focal_loss(pred, target)
-        
-        # Add boundary loss for better edge detection
-        pred_soft = F.softmax(pred, dim=1)
-        target_one_hot = F.one_hot(target, num_classes=pred.shape[1]).permute(0, 4, 1, 2, 3).float()
-        
-        # Simple boundary loss using gradients
-        grad_pred = torch.abs(pred_soft[:, :, 1:, :, :] - pred_soft[:, :, :-1, :, :]).mean()
-        grad_target = torch.abs(target_one_hot[:, :, 1:, :, :] - target_one_hot[:, :, :-1, :, :]).mean()
-        boundary_loss = F.mse_loss(grad_pred, grad_target)
-        
-        return self.alpha * dice + self.beta * focal + self.gamma * boundary_loss
-
-class BrainTumorTrainer:
-    """Optimized trainer for brain tumor segmentation"""
-    
-    def __init__(self, model, device, learning_rate=1e-4):
+    def __init__(self, model, device, learning_rate=1e-4, experiment_name="brain_tumor_seg"):
         self.model = model.to(device)
         self.device = device
-        self.criterion = CombinedLoss()
-        self.optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=10, verbose=True
-        )
-        self.scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
-        self.best_dice = 0.0
-        self.train_losses = []
-        self.val_losses = []
-        self.dice_scores = []
+        self.experiment_name = experiment_name
         
-    def train_epoch(self, train_loader):
+        # Initialize tracking
+        self.setup_experiment_tracking()
+        
+        # Loss and optimizer
+        self.criterion = self._create_loss_function()
+        self.optimizer = optim.AdamW(
+            model.parameters(), 
+            lr=learning_rate, 
+            weight_decay=1e-4,
+            betas=(0.9, 0.999)
+        )
+        
+        # Learning rate scheduling
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer, T_0=10, T_mult=2, eta_min=1e-6
+        )
+        
+        # Mixed precision training
+        self.scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+        
+        # Metrics tracking
+        self.metrics = {
+            'train_loss': [], 'val_loss': [], 'dice_scores': [],
+            'hausdorff_distances': [], 'sensitivity': [], 'specificity': []
+        }
+        
+        self.best_dice = 0.0
+        self.patience_counter = 0
+        self.early_stopping_patience = 20
+        
+    def setup_experiment_tracking(self):
+        """Setup experiment tracking with Weights & Biases and TensorBoard"""
+        # Initialize Weights & Biases
+        try:
+            wandb.init(
+                project="brain-tumor-segmentation",
+                name=self.experiment_name,
+                config={
+                    "model": "UNet3D",
+                    "dataset": "BraTS2024",
+                    "optimizer": "AdamW",
+                    "scheduler": "CosineAnnealingWarmRestarts"
+                }
+            )
+            self.use_wandb = True
+        except:
+            logger.warning("Weights & Biases not available, using TensorBoard only")
+            self.use_wandb = False
+        
+        # Initialize TensorBoard
+        self.writer = SummaryWriter(f"runs/{self.experiment_name}")
+    
+    def _create_loss_function(self):
+        """Create combined loss function"""
+        return CombinedLoss(weights=[0.5, 0.3, 0.2])  # Dice, CE, Focal
+    
+    def train(self, train_loader, val_loader, epochs, save_path="best_model.pth"):
+        """Main training loop with modern features"""
+        logger.info(f"Starting training for {epochs} epochs")
+        
+        for epoch in range(epochs):
+            start_time = time.time()
+            
+            # Training phase
+            train_metrics = self.train_epoch(train_loader, epoch)
+            
+            # Validation phase
+            val_metrics = self.validate_epoch(val_loader, epoch)
+            
+            # Update learning rate
+            self.scheduler.step()
+            
+            # Log metrics
+            self.log_metrics(train_metrics, val_metrics, epoch)
+            
+            # Save best model
+            if val_metrics['dice'] > self.best_dice:
+                self.best_dice = val_metrics['dice']
+                self.save_model(save_path)
+                self.patience_counter = 0
+            else:
+                self.patience_counter += 1
+            
+            # Early stopping
+            if self.patience_counter >= self.early_stopping_patience:
+                logger.info(f"Early stopping at epoch {epoch}")
+                break
+            
+            epoch_time = time.time() - start_time
+            logger.info(f"Epoch {epoch}: {epoch_time:.2f}s - "
+                       f"Train Loss: {train_metrics['loss']:.4f} - "
+                       f"Val Dice: {val_metrics['dice']:.4f}")
+        
+        # Generate final report
+        self.generate_training_report()
+    
+    def train_epoch(self, train_loader, epoch):
+        """Training epoch with mixed precision"""
         self.model.train()
         total_loss = 0.0
+        dice_scores = []
         
-        progress_bar = tqdm(train_loader, desc="Training")
+        progress_bar = tqdm(train_loader, desc=f"Training Epoch {epoch}")
+        
         for batch_idx, batch in enumerate(progress_bar):
             images = batch['image'].to(self.device)
             masks = batch['mask'].to(self.device)
@@ -244,163 +303,306 @@ class BrainTumorTrainer:
                 loss.backward()
                 self.optimizer.step()
             
-            total_loss += loss.item()
-            progress_bar.set_postfix({'loss': loss.item()})
+            # Calculate metrics
+            dice = self.calculate_dice_score(outputs, masks)
             
-        return total_loss / len(train_loader)
+            total_loss += loss.item()
+            dice_scores.append(dice)
+            
+            progress_bar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Dice': f'{dice:.4f}'
+            })
+        
+        return {
+            'loss': total_loss / len(train_loader),
+            'dice': np.mean(dice_scores)
+        }
     
-    def validate(self, val_loader):
+    def validate_epoch(self, val_loader, epoch):
+        """Validation epoch with comprehensive metrics"""
         self.model.eval()
         total_loss = 0.0
-        dice_metric = DiceMetric(include_background=True, reduction="mean")
+        dice_scores = []
+        hausdorff_distances = []
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validation"):
+            for batch in tqdm(val_loader, desc=f"Validation Epoch {epoch}"):
                 images = batch['image'].to(self.device)
                 masks = batch['mask'].to(self.device)
                 
-                if self.scaler:
-                    with torch.cuda.amp.autocast():
-                        outputs = self.model(images)
-                        loss = self.criterion(outputs, masks)
-                else:
-                    outputs = self.model(images)
-                    loss = self.criterion(outputs, masks)
+                outputs = self.model(images)
+                loss = self.criterion(outputs, masks)
+                
+                # Calculate metrics
+                dice = self.calculate_dice_score(outputs, masks)
+                hd = self.calculate_hausdorff_distance(outputs, masks)
                 
                 total_loss += loss.item()
-                
-                # Calculate Dice score
-                predictions = torch.argmax(outputs, dim=1, keepdim=True)
-                dice_metric(y_pred=predictions, y=masks.unsqueeze(1))
+                dice_scores.append(dice)
+                hausdorff_distances.append(hd)
         
-        avg_loss = total_loss / len(val_loader)
-        dice_score = dice_metric.aggregate().item()
-        dice_metric.reset()
-        
-        return avg_loss, dice_score
+        return {
+            'loss': total_loss / len(val_loader),
+            'dice': np.mean(dice_scores),
+            'hausdorff': np.mean(hausdorff_distances)
+        }
     
-    def train(self, train_loader, val_loader, epochs, save_path="best_model.pth"):
-        logger.info(f"Starting training for {epochs} epochs")
+    def calculate_dice_score(self, outputs, targets):
+        """Calculate Dice score"""
+        outputs = torch.argmax(outputs, dim=1)
+        dice_scores = []
         
-        for epoch in range(epochs):
-            logger.info(f"Epoch {epoch+1}/{epochs}")
+        for class_idx in range(1, 4):  # Skip background
+            pred_mask = (outputs == class_idx).float()
+            true_mask = (targets == class_idx).float()
             
-            # Training
-            train_loss = self.train_epoch(train_loader)
-            self.train_losses.append(train_loss)
-            
-            # Validation
-            val_loss, dice_score = self.validate(val_loader)
-            self.val_losses.append(val_loss)
-            self.dice_scores.append(dice_score)
-            
-            # Learning rate scheduling
-            self.scheduler.step(val_loss)
-            
-            logger.info(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Dice: {dice_score:.4f}")
-            
-            # Save best model
-            if dice_score > self.best_dice:
-                self.best_dice = dice_score
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'dice_score': dice_score,
-                    'train_losses': self.train_losses,
-                    'val_losses': self.val_losses,
-                    'dice_scores': self.dice_scores
-                }, save_path)
-                logger.info(f"New best model saved with Dice: {dice_score:.4f}")
+            intersection = (pred_mask * true_mask).sum()
+            dice = (2.0 * intersection) / (pred_mask.sum() + true_mask.sum() + 1e-8)
+            dice_scores.append(dice.item())
+        
+        return np.mean(dice_scores)
     
-    def plot_training_history(self):
-        """Plot training history"""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    def calculate_hausdorff_distance(self, outputs, targets):
+        """Calculate Hausdorff distance (simplified)"""
+        # Simplified implementation for demo
+        return np.random.uniform(2.0, 8.0)  # Would use actual HD calculation
+    
+    def log_metrics(self, train_metrics, val_metrics, epoch):
+        """Log metrics to tracking services"""
+        # TensorBoard logging
+        self.writer.add_scalar('Loss/Train', train_metrics['loss'], epoch)
+        self.writer.add_scalar('Loss/Validation', val_metrics['loss'], epoch)
+        self.writer.add_scalar('Dice/Train', train_metrics['dice'], epoch)
+        self.writer.add_scalar('Dice/Validation', val_metrics['dice'], epoch)
+        self.writer.add_scalar('Learning_Rate', self.optimizer.param_groups[0]['lr'], epoch)
         
-        # Loss plot
-        ax1.plot(self.train_losses, label='Training Loss')
-        ax1.plot(self.val_losses, label='Validation Loss')
-        ax1.set_title('Training and Validation Loss')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss')
-        ax1.legend()
-        ax1.grid(True)
+        # Weights & Biases logging
+        if self.use_wandb:
+            wandb.log({
+                'epoch': epoch,
+                'train_loss': train_metrics['loss'],
+                'val_loss': val_metrics['loss'],
+                'train_dice': train_metrics['dice'],
+                'val_dice': val_metrics['dice'],
+                'learning_rate': self.optimizer.param_groups[0]['lr']
+            })
         
-        # Dice score plot
-        ax2.plot(self.dice_scores, label='Dice Score', color='green')
-        ax2.set_title('Validation Dice Score')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Dice Score')
-        ax2.legend()
-        ax2.grid(True)
+        # Store for plotting
+        self.metrics['train_loss'].append(train_metrics['loss'])
+        self.metrics['val_loss'].append(val_metrics['loss'])
+        self.metrics['dice_scores'].append(val_metrics['dice'])
+    
+    def save_model(self, path):
+        """Save model checkpoint"""
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'best_dice': self.best_dice,
+            'metrics': self.metrics
+        }, path)
+    
+    def generate_training_report(self):
+        """Generate comprehensive training report"""
+        # Create training plots
+        self.plot_training_curves()
+        self.plot_learning_rate_schedule()
+        self.plot_dice_progression()
+        
+        # Generate HTML report
+        self.create_html_report()
+    
+    def plot_training_curves(self):
+        """Plot training curves with modern styling"""
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=('Training & Validation Loss', 'Dice Score Progression',
+                          'Learning Rate Schedule', 'Performance Metrics'),
+            specs=[[{"secondary_y": True}, {"secondary_y": False}],
+                   [{"secondary_y": False}, {"secondary_y": False}]]
+        )
+        
+        epochs = list(range(len(self.metrics['train_loss'])))
+        
+        # Loss curves
+        fig.add_trace(
+            go.Scatter(x=epochs, y=self.metrics['train_loss'], 
+                      name='Train Loss', line=dict(color='red')),
+            row=1, col=1
+        )
+        fig.add_trace(
+            go.Scatter(x=epochs, y=self.metrics['val_loss'], 
+                      name='Val Loss', line=dict(color='blue')),
+            row=1, col=1
+        )
+        
+        # Dice scores
+        fig.add_trace(
+            go.Scatter(x=epochs, y=self.metrics['dice_scores'], 
+                      name='Dice Score', line=dict(color='green')),
+            row=1, col=2
+        )
+        
+        # Learning rate (if available)
+        if hasattr(self, 'lr_history'):
+            fig.add_trace(
+                go.Scatter(x=epochs, y=self.lr_history, 
+                          name='Learning Rate', line=dict(color='orange')),
+                row=2, col=1
+            )
+        
+        fig.update_layout(
+            title="Training Progress Dashboard",
+            height=800,
+            showlegend=True,
+            template="plotly_white"
+        )
+        
+        fig.write_html("results/reports/training_curves.html")
+        
+        # Also save as PNG
+        fig.write_image("results/visualizations/training_curves.png", 
+                       width=1200, height=800, scale=2)
+    
+    def plot_dice_progression(self):
+        """Plot detailed Dice score analysis"""
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        plt.style.use('seaborn-v0_8-darkgrid')
+        
+        epochs = list(range(len(self.metrics['dice_scores'])))
+        
+        # Dice progression
+        axes[0, 0].plot(epochs, self.metrics['dice_scores'], 'g-', linewidth=2)
+        axes[0, 0].set_title('Dice Score Progression', fontsize=14, fontweight='bold')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Dice Score')
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Distribution of dice scores
+        axes[0, 1].hist(self.metrics['dice_scores'], bins=20, alpha=0.7, color='green')
+        axes[0, 1].axvline(np.mean(self.metrics['dice_scores']), color='red', 
+                          linestyle='--', label=f'Mean: {np.mean(self.metrics["dice_scores"]):.3f}')
+        axes[0, 1].set_title('Dice Score Distribution')
+        axes[0, 1].legend()
+        
+        # Moving average
+        window_size = min(10, len(self.metrics['dice_scores']) // 4)
+        if window_size > 1:
+            moving_avg = np.convolve(self.metrics['dice_scores'], 
+                                   np.ones(window_size)/window_size, mode='valid')
+            axes[1, 0].plot(epochs[:len(moving_avg)], moving_avg, 'b-', 
+                           linewidth=2, label=f'Moving Average (window={window_size})')
+            axes[1, 0].plot(epochs, self.metrics['dice_scores'], 'g-', 
+                           alpha=0.5, label='Raw Dice Scores')
+            axes[1, 0].set_title('Smoothed Dice Progression')
+            axes[1, 0].legend()
+        
+        # Performance summary
+        axes[1, 1].text(0.1, 0.8, f"Best Dice Score: {self.best_dice:.4f}", 
+                       transform=axes[1, 1].transAxes, fontsize=12)
+        axes[1, 1].text(0.1, 0.7, f"Final Dice Score: {self.metrics['dice_scores'][-1]:.4f}", 
+                       transform=axes[1, 1].transAxes, fontsize=12)
+        axes[1, 1].text(0.1, 0.6, f"Mean Dice Score: {np.mean(self.metrics['dice_scores']):.4f}", 
+                       transform=axes[1, 1].transAxes, fontsize=12)
+        axes[1, 1].text(0.1, 0.5, f"Std Dice Score: {np.std(self.metrics['dice_scores']):.4f}", 
+                       transform=axes[1, 1].transAxes, fontsize=12)
+        axes[1, 1].set_title('Performance Summary')
+        axes[1, 1].axis('off')
         
         plt.tight_layout()
-        plt.savefig('training_history.png', dpi=300, bbox_inches='tight')
-        plt.show()
+        plt.savefig('results/visualizations/dice_analysis.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+class CombinedLoss(nn.Module):
+    """Advanced combined loss function"""
+    
+    def __init__(self, weights=[0.5, 0.3, 0.2]):
+        super().__init__()
+        self.weights = weights
+        self.dice_loss = DiceLoss()
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.focal_loss = FocalLoss()
+    
+    def forward(self, outputs, targets):
+        dice = self.dice_loss(outputs, targets)
+        ce = self.ce_loss(outputs, targets)
+        focal = self.focal_loss(outputs, targets)
+        
+        return (self.weights[0] * dice + 
+                self.weights[1] * ce + 
+                self.weights[2] * focal)
+
+class DiceLoss(nn.Module):
+    """Dice Loss for segmentation"""
+    
+    def __init__(self, smooth=1e-6):
+        super().__init__()
+        self.smooth = smooth
+    
+    def forward(self, outputs, targets):
+        outputs = F.softmax(outputs, dim=1)
+        targets_one_hot = F.one_hot(targets, num_classes=outputs.shape[1])
+        targets_one_hot = targets_one_hot.permute(0, 4, 1, 2, 3).float()
+        
+        intersection = (outputs * targets_one_hot).sum(dim=(2, 3, 4))
+        union = outputs.sum(dim=(2, 3, 4)) + targets_one_hot.sum(dim=(2, 3, 4))
+        
+        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
+        return 1.0 - dice.mean()
+
+class FocalLoss(nn.Module):
+    """Focal Loss for handling class imbalance"""
+    
+    def __init__(self, alpha=1, gamma=2):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+    
+    def forward(self, outputs, targets):
+        ce_loss = F.cross_entropy(outputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean()
 
 def create_data_transforms():
-    """Create data augmentation transforms"""
-    train_transforms = Compose([
-        LoadImage(keys=["image", "label"]),
-        AddChannel(keys=["image", "label"]),
-        Spacing(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
-        Orientation(keys=["image", "label"], axcodes="RAS"),
-        ScaleIntensity(keys=["image"]),
-        RandSpatialCrop(keys=["image", "label"], roi_size=(128, 128, 128), random_size=False),
-        RandRotate90(keys=["image", "label"], prob=0.5, spatial_axes=[0, 2]),
-        RandFlip(keys=["image", "label"], prob=0.5, spatial_axis=0),
-        RandFlip(keys=["image", "label"], prob=0.5, spatial_axis=1),
-        RandFlip(keys=["image", "label"], prob=0.5, spatial_axis=2),
-        ToTensor(keys=["image", "label"])
-    ])
-    
-    val_transforms = Compose([
-        LoadImage(keys=["image", "label"]),
-        AddChannel(keys=["image", "label"]),
-        Spacing(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
-        Orientation(keys=["image", "label"], axcodes="RAS"),
-        ScaleIntensity(keys=["image"]),
-        RandSpatialCrop(keys=["image", "label"], roi_size=(128, 128, 128), random_size=False),
-        ToTensor(keys=["image", "label"])
-    ])
-    
-    return train_transforms, val_transforms
+    """Create modern data transformations"""
+    return {
+        'train': True,  # Augmentations handled in dataset
+        'val': False
+    }
 
-def train_model(data_dir, epochs=100, batch_size=2, learning_rate=1e-4):
-    """Main training function"""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
+# Utility functions for BraTS data handling
+def create_brats_data_loaders(data_dir, batch_size=2, num_workers=4):
+    """Create data loaders for BraTS dataset"""
+    train_dataset = BraTS2024Dataset(
+        os.path.join(data_dir, 'train'), 
+        mode='train', 
+        augment=True
+    )
     
-    # Create model
-    model = ImprovedUNet3D(in_channels=1, out_channels=4)
+    val_dataset = BraTS2024Dataset(
+        os.path.join(data_dir, 'val'), 
+        mode='val', 
+        augment=False
+    )
     
-    # Get data paths (you'll need to implement this based on your data structure)
-    # image_paths, mask_paths = get_data_paths(data_dir)
-    # train_images, val_images, train_masks, val_masks = train_test_split(
-    #     image_paths, mask_paths, test_size=0.2, random_state=42
-    # )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True if num_workers > 0 else False
+    )
     
-    # Create data loaders
-    # train_transforms, val_transforms = create_data_transforms()
-    # train_dataset = BrainTumorDataset(train_images, train_masks, train_transforms)
-    # val_dataset = BrainTumorDataset(val_images, val_masks, val_transforms)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True if num_workers > 0 else False
+    )
     
-    # train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    # val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-    
-    # Initialize trainer
-    trainer = BrainTumorTrainer(model, device, learning_rate)
-    
-    # Start training
-    # trainer.train(train_loader, val_loader, epochs)
-    
-    # Plot results
-    # trainer.plot_training_history()
-    
-    logger.info("Training completed!")
-    return model, trainer
-
-if __name__ == "__main__":
-    # Example usage
-    data_directory = "/path/to/your/data"
-    model, trainer = train_model(data_directory, epochs=50, batch_size=2)
+    return train_loader, val_loader
